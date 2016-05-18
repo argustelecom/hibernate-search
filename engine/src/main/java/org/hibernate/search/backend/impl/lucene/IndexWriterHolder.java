@@ -21,12 +21,16 @@
 package org.hibernate.search.backend.impl.lucene;
 
 import java.io.IOException;
+import java.util.Date;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.SimpleAnalyzer;
 import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.IndexCommit;
+import org.apache.lucene.index.IndexDeletionPolicy;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
@@ -132,6 +136,12 @@ class IndexWriterHolder {
 		return getIndexWriter( null );
 	}
 
+	// {ARGUS_CODE}
+	public static final  String MAX_COMMIT_AGE_MINUTES_PROP_NAME = "argus.temp.hs.max-commit-age-minutes";
+	public static final String MAX_COMMITS_TO_KEEP_PROP_NAME= "argus.temp.hs.max-commits-to-keep";
+	// {ARGUS_CODE}
+	
+	
 	/**
 	 * Create as new IndexWriter using the passed in IndexWriterConfig as a template, but still applies some late changes:
 	 * we need to override the MergeScheduler to handle background errors, and a new instance needs to be created for each
@@ -143,8 +153,84 @@ class IndexWriterHolder {
 		writerConfig.setMergePolicy( newMergePolicy );
 		MergeScheduler mergeScheduler = new ConcurrentMergeScheduler( this.errorHandler, this.indexName );
 		writerConfig.setMergeScheduler( mergeScheduler );
+		
+		//kostd@Argus, TASK-73805:
+		//Use del-policy that give some time before commit deletion, while readers can refresh state to newest commit.
+		//Hope this prevents FNFE in backend-thread.
+		// {ARGUS_CODE}
+		writerConfig.setIndexDeletionPolicy(new GentleIndexDeletionPolicy());
+		// {ARGUS_CODE}
 		return new IndexWriter( directoryProvider.getDirectory(), writerConfig );
 	}
+	
+	
+	// {ARGUS_CODE}
+	class GentleIndexDeletionPolicy implements IndexDeletionPolicy {
+
+		int maxCommitAge = 0;
+		int maxCommitsToKeep = 1;
+
+		public GentleIndexDeletionPolicy() {
+			this.maxCommitAge = Integer.parseInt(System.getProperty(MAX_COMMIT_AGE_MINUTES_PROP_NAME, "0"));
+			if (this.maxCommitAge < 0) {
+				this.maxCommitAge = 0;
+			}
+			this.maxCommitsToKeep = Integer.parseInt(System.getProperty(MAX_COMMITS_TO_KEEP_PROP_NAME, "1"));
+			if (this.maxCommitsToKeep < 1) {
+				this.maxCommitsToKeep = 1;
+			}
+			log.debug("Argus gentle deletion policy created! maxAge = " + maxCommitAge + ", maxCommitsToKeep = " + maxCommitsToKeep);
+		}
+
+		@Override
+		public void onInit(List<? extends IndexCommit> commits) throws IOException {
+			onCommit(commits);
+		}
+
+		/*
+		 * Copy-pasted from SolrDeletionPolicy.<p> Not use directly because it more general what we need.
+		 */
+		@Override
+		public void onCommit(List<? extends IndexCommit> commits) throws IOException {
+			synchronized (this) {
+				long maxCommitAgeTimeStamp = -1L;
+				IndexCommit newest = commits.get(commits.size() - 1);
+				log.info("newest commit = " + newest.getVersion());
+
+				int totalKept = 1;
+
+				// work our way from newest to oldest, skipping the first since we always want to keep it.
+				for (int i = commits.size() - 2; i >= 0; i--) {
+					IndexCommit commit = commits.get(i);
+
+					// delete anything too old, regardless of other policies
+					try {
+						if (maxCommitAge > 0) {
+							if (maxCommitAgeTimeStamp == -1) {
+								maxCommitAgeTimeStamp = new Date().getTime() - maxCommitAge * 60 * 1000;
+							}
+							if (commit.getTimestamp() < maxCommitAgeTimeStamp) {
+								commit.delete();
+								continue;
+							}
+						}
+					} catch (Exception e) {
+						log.warn("Exception while checking commit point's age for deletion", e);
+					}
+
+					if (totalKept < maxCommitsToKeep) {
+						totalKept++;
+						continue;
+					}
+
+					commit.delete();
+				}
+
+			} // end synchronized
+		}
+	}
+
+	// {ARGUS_CODE}
 
 	/**
 	 * Commits changes to a previously opened IndexWriter.

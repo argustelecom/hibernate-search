@@ -72,6 +72,9 @@ final class LuceneBackendQueueTask implements Runnable {
 			handleException( e );
 		}
 		catch (Exception e) {
+			//{ARGUS_CODE}
+			log.error("error in lucene backend task, this.hash = " + this.hashCode());
+			//{ARGUS_CODE}
 			log.backendError( e );
 			handleException( e );
 		}
